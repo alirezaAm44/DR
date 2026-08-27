@@ -1,0 +1,46 @@
+#######################################
+# Syntax Coloring Map for DJIRonin
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+DJIRonin	KEYWORD1
+Motion	KEYWORD1
+Camera	KEYWORD1
+Focus	KEYWORD1
+ActiveTrack	KEYWORD1
+ICANDriver	KEYWORD1
+MCP2515Driver	KEYWORD1
+MockCANDriver	KEYWORD1
+PacketBuilder	KEYWORD1
+PacketParser	KEYWORD1
+Result	KEYWORD1
+CANFrame	KEYWORD1
+PacketBuffer	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+begin	KEYWORD2
+moveTo	KEYWORD2
+moveBy	KEYWORD2
+joystick	KEYWORD2
+setSpeedScale	KEYWORD2
+stop	KEYWORD2
+home	KEYWORD2
+recordStart	KEYWORD2
+recordStop	KEYWORD2
+photo	KEYWORD2
+centerFocus	KEYWORD2
+calibrate	KEYWORD2
+start	KEYWORD2
+send	KEYWORD2
+receive	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+SOF	LITERAL1
+CAN_ID_TX	LITERAL1
+CAN_ID_RX	LITERAL1
