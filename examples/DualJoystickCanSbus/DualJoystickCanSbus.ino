@@ -1,65 +1,506 @@
+/**
+ * DualJoystickCanSbus.ino
+ *
+ * DJI Ronin R SDK + MCP2515 CAN + SBUS
+ *
+ * Uses the standard mcp2515 Arduino library directly.
+ * MCP2515Driver.h is intentionally NOT used.
+ */
+
 #include <SPI.h>
+#include <SoftwareSerial.h>
+#include <mcp2515.h>
 #include <DJIRonin.h>
-#include "../../src/transport/mcp2515/MCP2515Driver.h"
-#include <SBUSNanoTx/SBUSNanoTx.h>
+
 using namespace dji::ronin;
 
-const bool ENABLE_CAN = true;
+const bool ENABLE_CAN  = true;
 const bool ENABLE_SBUS = true;
-const bool SBUS_INVERTED = false;
-const uint8_t JOY_YAW=A1, JOY_PITCH=A2, REC_PIN=2, CAN_CS=10;
-const int JOY_CENTER=512, DEAD_ZONE=40;
-const int16_t DJI_MIN=-7500, DJI_MAX=7500;
-const uint16_t SBUS_MIN=352, SBUS_MID=1024, SBUS_MAX=1696;
-const uint8_t CH_YAW=0, CH_PITCH=1, CH_RECORD=3;
-const uint32_t JOY_MS=20, SBUS_MS=14, INFO_MS=500, STATUS_MS=250, DEBOUNCE_MS=40;
+const bool USE_SBUS_MOTION = true;
 
-MCP2515Driver can(CAN_CS);
-DJIRonin ronin(can);
+const int JOYSTICK_X_PIN  = A1;
+const int JOYSTICK_Y_PIN  = A2;
+const int JOYSTICK_SW_PIN = 2;
+const int MCP2515_CS_PIN  = 10;
+const int SBUS_TX_PIN     = 8;
+
+const CAN_CLOCK MCP_CLOCK = MCP_8MHZ;
+
+const int JOYSTICK_CENTER = 512;
+const int DEAD_ZONE       = 40;
+const int16_t DJI_MIN     = -7500;
+const int16_t DJI_MAX     = 7500;
+
+const uint16_t SBUS_MIN = 352;
+const uint16_t SBUS_MID = 1024;
+const uint16_t SBUS_MAX = 1696;
+const unsigned long SBUS_INTERVAL_MS = 14;
+
+const uint8_t SBUS_CH_YAW   = 0;
+const uint8_t SBUS_CH_PITCH = 1;
+const uint8_t SBUS_CH_ROLL  = 3;
+
+SoftwareSerial sbusSerial(9, SBUS_TX_PIN);
+
+const unsigned long JOYSTICK_INTERVAL_MS = 20;
+const unsigned long INFO_INTERVAL_MS     = 200;
+const unsigned long STATUS_PRINT_MS      = 200;
+const unsigned long DEBOUNCE_MS          = 40;
+
+MCP2515 mcp2515(MCP2515_CS_PIN);
 PacketBuilder builder;
-SBUSNanoTx sbus(SBUS_INVERTED);
+PacketParser parser;
 
-uint32_t canOk=0, canFail=0, infoTx=0, infoRx=0, infoNoRx=0, infoErr=0;
-uint32_t sbusOk=0, sbusDrop=0;
-uint32_t tJoy=0,tSbus=0,tInfo=0,tStatus=0;
-int16_t yaw=0,pitch=0,roll=0;
-bool recording=false, buttonStable=HIGH, buttonLast=HIGH;
-uint32_t buttonChangedAt=0;
+unsigned long lastJoystickMs = 0;
+unsigned long lastInfoMs     = 0;
+unsigned long lastStatusMs   = 0;
+unsigned long lastSbusMs     = 0;
 
-const char* errorName(Error e){
-  switch(e){
-    case Error::Ok:return "Ok"; case Error::InvalidParameter:return "InvalidParameter";
-    case Error::PacketTooLarge:return "PacketTooLarge"; case Error::Crc16Mismatch:return "Crc16Mismatch";
-    case Error::Crc32Mismatch:return "Crc32Mismatch"; case Error::InvalidSof:return "InvalidSof";
-    case Error::InvalidLength:return "InvalidLength"; case Error::InvalidResponse:return "InvalidResponse";
-    case Error::Timeout:return "Timeout"; case Error::TransportError:return "TransportError";
-    case Error::ProtocolVersionMismatch:return "ProtocolVersionMismatch"; case Error::UnknownCommand:return "UnknownCommand";
-    case Error::BufferTooSmall:return "BufferTooSmall"; case Error::NotInitialized:return "NotInitialized";
-    case Error::NoData:return "NoData"; default:return "Unknown";
-  }
+uint32_t txJoystickCount  = 0;
+uint32_t txInfoCount      = 0;
+uint32_t txCameraCount    = 0;
+uint32_t txSbusCount      = 0;
+uint32_t rxPacketCount    = 0;
+uint32_t rxErrorCount     = 0;
+uint32_t canSendFailCount = 0;
+
+int16_t lastYaw = 0;
+int16_t lastPitch = 0;
+int16_t lastRoll = 0;
+
+bool haveAttitude = false;
+int16_t attYaw = 0;
+int16_t attRoll = 0;
+int16_t attPitch = 0;
+
+bool isRecording = false;
+bool lastButtonStable = HIGH;
+bool lastButtonRead = HIGH;
+unsigned long lastDebounceMs = 0;
+
+uint8_t rxAcc[MAX_PACKET_SIZE];
+uint16_t rxAccLen = 0;
+uint16_t rxExpectedLen = 0;
+
+uint16_t sbusChannels[16];
+
+int16_t mapJoystickToDJI(int rawValue, bool invert = false)
+{
+    int delta = rawValue - JOYSTICK_CENTER;
+    if (abs(delta) < DEAD_ZONE) return 0;
+    if (invert) delta = -delta;
+
+    long mapped = (long)delta * DJI_MAX / (JOYSTICK_CENTER - DEAD_ZONE);
+
+    if (mapped > DJI_MAX) mapped = DJI_MAX;
+    if (mapped < DJI_MIN) mapped = DJI_MIN;
+
+    return (int16_t)mapped;
 }
 
-void printHex(const uint8_t* d,size_t n){for(size_t i=0;i<n;i++){if(d[i]<16)Serial.print('0');Serial.print(d[i],HEX);Serial.print(i+1==n?'\n':' ');}}
-void logPacket(const char* s,const PacketBuffer& p){Serial.print('[');Serial.print(s);Serial.print(F("] len="));Serial.println(p.length);printHex(p.data,p.length);}
+uint16_t mapDjiToSbus(int16_t v)
+{
+    long span = (long)SBUS_MAX - (long)SBUS_MIN;
+    long mapped = (long)SBUS_MID + ((long)v * (span / 2)) / DJI_MAX;
 
-int16_t mapJoy(int raw,bool invert){
-  int d=raw-JOY_CENTER;if(abs(d)<=DEAD_ZONE)return 0;if(invert)d=-d;
-  if(d>0){long v=(long)(d-DEAD_ZONE)*DJI_MAX/(1023-JOY_CENTER-DEAD_ZONE);if(v>DJI_MAX)v=DJI_MAX;return(int16_t)v;}
-  long v=(long)(d+DEAD_ZONE)*DJI_MAX/(JOY_CENTER-DEAD_ZONE);if(v<DJI_MIN)v=DJI_MIN;return(int16_t)v;
+    if (mapped < SBUS_MIN) mapped = SBUS_MIN;
+    if (mapped > SBUS_MAX) mapped = SBUS_MAX;
+
+    return (uint16_t)mapped;
 }
-uint16_t djiToSbus(int16_t v){long half=((long)SBUS_MAX-SBUS_MIN)/2;long o=SBUS_MID+((long)v*half)/DJI_MAX;if(o<SBUS_MIN)o=SBUS_MIN;if(o>SBUS_MAX)o=SBUS_MAX;return(uint16_t)o;}
 
-bool buildJoy(PacketBuffer& out){JoystickPayload p;p.device_type=(uint8_t)ControllerType::Joystick;p.pitch_speed=pitch;p.roll_speed=roll;p.yaw_speed=yaw;auto r=builder.buildCommand(GimbalCmd::CMDSET,GimbalCmd::ExternalDeviceControl,p,ReplyRequirement::NoReply,out);if(r.isError()){Serial.print(F("[CAN BUILDER ERROR] "));Serial.println(errorName(r.error()));return false;}return true;}
-bool buildInfo(PacketBuffer& out){ObtainInfoRequestPayload p;p.ctrl_byte=0x01;auto r=builder.buildCommand(GimbalCmd::CMDSET,GimbalCmd::ObtainInformation,p,ReplyRequirement::ReplyRequired,out);if(r.isError()){Serial.print(F("[INFO BUILDER ERROR] "));Serial.println(errorName(r.error()));return false;}return true;}
+void printHex(const uint8_t* data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] < 0x10) Serial.print('0');
+        Serial.print(data[i], HEX);
+        Serial.print(' ');
+    }
+    Serial.println();
+}
 
-void requestInfo(){PacketBuffer p;if(!buildInfo(p)){infoErr++;return;}infoTx++;logPacket("CAN TX INFO",p);auto tx=ronin.sendPacket(p);if(tx.isError()){infoErr++;Serial.print(F("[CAN INFO TX ERROR] "));Serial.println(errorName(tx.error()));return;}auto rx=ronin.receivePacket(100);if(rx.isError()){infoNoRx++;Serial.print(F("[CAN INFO] no valid response: "));Serial.println(errorName(rx.error()));return;}infoRx++;const ParsedPacket& q=rx.value();Serial.println(F("[CAN INFO] RONIN RESPONSE"));Serial.print(F(" CmdSet=0x"));Serial.println(q.command.cmdSet,HEX);Serial.print(F(" CmdID=0x"));Serial.println(q.command.cmdId,HEX);Serial.print(F(" Length="));Serial.println(q.header.length);Serial.print(F(" Seq="));Serial.println(q.header.seq);Serial.print(F(" Payload="));Serial.println(q.payloadLen);if(q.hasReturnCode){Serial.print(F(" ReturnCode=0x"));Serial.println((uint8_t)q.returnCode,HEX);}}
+void sbusResetChannels()
+{
+    for (uint8_t i = 0; i < 16; i++) {
+        sbusChannels[i] = SBUS_MID;
+    }
+}
 
-bool sendJoy(){PacketBuffer p;if(!buildJoy(p))return false;auto r=ronin.sendPacket(p);if(r.isError()){Serial.print(F("[CAN JOY TX ERROR] "));Serial.println(errorName(r.error()));return false;}return true;}
+void sbusPackAndSend()
+{
+    uint8_t packet[25];
+    packet[0] = 0x0F;
 
-void sendSbus(){uint16_t ch[SBUSNanoTx::CHANNELS];for(uint8_t i=0;i<SBUSNanoTx::CHANNELS;i++)ch[i]=SBUS_MID;ch[CH_YAW]=djiToSbus(yaw);ch[CH_PITCH]=djiToSbus(pitch);ch[CH_RECORD]=recording?SBUS_MAX:SBUS_MIN;if(!sbus.write(ch,false,false,false,false)){sbusDrop++;return;}sbusOk++;}
+    uint8_t byteIdx = 1;
+    uint32_t bitBuf = 0;
+    uint8_t bitCnt = 0;
 
-void handleButton(){bool raw=digitalRead(REC_PIN);if(raw!=buttonLast){buttonChangedAt=millis();buttonLast=raw;}if(millis()-buttonChangedAt<DEBOUNCE_MS)return;if(buttonStable==HIGH&&raw==LOW){recording=!recording;if(ENABLE_CAN){auto r=recording?ronin.camera.recordStart():ronin.camera.recordStop();if(r.isError()){Serial.print(F("[REC CAN ERROR] "));Serial.println(errorName(r.error()));}}}buttonStable=raw;}
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        uint16_t v = sbusChannels[ch] & 0x07FF;
+        bitBuf |= ((uint32_t)v) << bitCnt;
+        bitCnt += 11;
 
-void setup(){Serial.begin(115200);delay(500);pinMode(REC_PIN,INPUT_PULLUP);builder.resetSequence(0);Serial.println(F("=== DJI R SDK / ARDUINO NANO / CAN + SBUS ==="));Serial.println(F("A1=Yaw A2=Pitch D2=Record D8=SBUS D10=MCP2515 CS"));if(ENABLE_CAN){auto r=ronin.begin();if(r.isError()){Serial.print(F("[CAN INIT ERROR] "));Serial.println(errorName(r.error()));}else Serial.println(F("[CAN OK]"));}if(ENABLE_SBUS){if(sbus.begin())Serial.println(F("[SBUS OK]"));else Serial.println(F("[SBUS INIT ERROR]"));}}
+        while (bitCnt >= 8) {
+            packet[byteIdx++] = (uint8_t)(bitBuf & 0xFF);
+            bitBuf >>= 8;
+            bitCnt -= 8;
+        }
+    }
 
-void loop(){uint32_t now=millis();yaw=mapJoy(analogRead(JOY_YAW),false);pitch=mapJoy(analogRead(JOY_PITCH),true);roll=0;handleButton();if(ENABLE_CAN&&now-tJoy>=JOY_MS){tJoy=now;if(sendJoy())canOk++;else canFail++;}if(ENABLE_CAN&&now-tInfo>=INFO_MS){tInfo=now;requestInfo();}if(ENABLE_SBUS&&now-tSbus>=SBUS_MS){tSbus=now;sendSbus();}if(now-tStatus>=STATUS_MS){tStatus=now;Serial.print(F("[STATUS] Y="));Serial.print(yaw);Serial.print(F(" P="));Serial.print(pitch);Serial.print(F(" REC="));Serial.print(recording?F("ON"):F("OFF"));Serial.print(F(" | CAN ok="));Serial.print(canOk);Serial.print(F(" fail="));Serial.print(canFail);Serial.print(F(" infoRX="));Serial.print(infoRx);Serial.print(F(" | SBUS="));Serial.println(sbusOk);}}
+    if (bitCnt > 0 && byteIdx < 23) {
+        packet[byteIdx++] = (uint8_t)(bitBuf & 0xFF);
+    }
+
+    while (byteIdx < 23) packet[byteIdx++] = 0;
+
+    packet[23] = 0x00;
+    packet[24] = 0x00;
+
+    for (uint8_t i = 0; i < 25; i++) {
+        sbusSerial.write(packet[i]);
+    }
+
+    txSbusCount++;
+}
+
+void updateSbusFromJoystick(int16_t yaw, int16_t pitch, int16_t roll)
+{
+    sbusResetChannels();
+
+    if (!USE_SBUS_MOTION) return;
+
+    sbusChannels[SBUS_CH_YAW]   = mapDjiToSbus(yaw);
+    sbusChannels[SBUS_CH_PITCH] = mapDjiToSbus(pitch);
+    sbusChannels[SBUS_CH_ROLL]  = mapDjiToSbus(roll);
+}
+
+bool sendPacketMultiFrame(const PacketBuffer& packet)
+{
+    size_t offset = 0;
+
+    while (offset < packet.length) {
+        struct can_frame frame;
+        frame.can_id = CAN_ID_TX;
+        frame.can_dlc = 0;
+
+        while (frame.can_dlc < 8 && offset < packet.length) {
+            frame.data[frame.can_dlc++] = packet.data[offset++];
+        }
+
+        MCP2515::ERROR e = mcp2515.sendMessage(&frame);
+
+        if (e != MCP2515::ERROR_OK) {
+            canSendFailCount++;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void handleCompleteRxPacket(const uint8_t* data, uint16_t len)
+{
+    rxPacketCount++;
+
+    auto result = parser.parse(data, len);
+
+    if (result.isError()) {
+        rxErrorCount++;
+        Serial.println(F("----- RX PARSE ERROR -----"));
+        printHex(data, len);
+        return;
+    }
+
+    ParsedPacket pkt = result.value();
+
+    Serial.println(F("----- RX FROM RONIN -----"));
+    Serial.print(F("CmdSet=0x"));
+    Serial.print(pkt.command.cmdSet, HEX);
+    Serial.print(F(" CmdID=0x"));
+    Serial.println(pkt.command.cmdId, HEX);
+
+    Serial.print(F("RAW: "));
+    printHex(data, len);
+
+    if (pkt.hasReturnCode) {
+        Serial.print(F("ReturnCode=0x"));
+        Serial.println(static_cast<uint8_t>(pkt.returnCode), HEX);
+        if (pkt.returnCode != ReturnCode::Success) rxErrorCount++;
+    }
+
+    if (pkt.command.cmdSet == GimbalCmd::CMDSET &&
+        pkt.command.cmdId == GimbalCmd::ObtainInformation &&
+        pkt.payloadLen >= sizeof(ObtainInfoReplyPayload)) {
+
+        const ObtainInfoReplyPayload* rep =
+            reinterpret_cast<const ObtainInfoReplyPayload*>(pkt.payload);
+
+        haveAttitude = true;
+        attYaw = rep->yaw;
+        attRoll = rep->roll;
+        attPitch = rep->pitch;
+
+        Serial.print(F("Attitude Y="));
+        Serial.print(attYaw / 10.0f, 1);
+        Serial.print(F(" P="));
+        Serial.println(attPitch / 10.0f, 1);
+    }
+
+    Serial.println(F("--------------------------"));
+}
+
+void pollIncoming()
+{
+    if (!ENABLE_CAN) return;
+
+    struct can_frame frame;
+
+    while (mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
+        if ((frame.can_id & 0x7FF) != CAN_ID_RX) continue;
+
+        for (uint8_t i = 0; i < frame.can_dlc; i++) {
+            uint8_t b = frame.data[i];
+
+            if (rxAccLen == 0) {
+                if (b != SOF) continue;
+                rxAcc[0] = b;
+                rxAccLen = 1;
+                rxExpectedLen = 0;
+                continue;
+            }
+
+            if (rxAccLen < MAX_PACKET_SIZE) {
+                rxAcc[rxAccLen++] = b;
+            } else {
+                rxAccLen = 0;
+                rxExpectedLen = 0;
+                continue;
+            }
+
+            if (rxAccLen == 3) {
+                uint16_t verLen =
+                    (uint16_t)rxAcc[1] |
+                    ((uint16_t)rxAcc[2] << 8);
+
+                rxExpectedLen = verLen & LENGTH_MASK;
+
+                if (rxExpectedLen < MIN_PACKET_SIZE ||
+                    rxExpectedLen > MAX_PACKET_SIZE) {
+                    rxAccLen = 0;
+                    rxExpectedLen = 0;
+                }
+            }
+
+            if (rxExpectedLen > 0 &&
+                rxAccLen >= rxExpectedLen) {
+                handleCompleteRxPacket(rxAcc, rxExpectedLen);
+                rxAccLen = 0;
+                rxExpectedLen = 0;
+            }
+        }
+    }
+}
+
+bool sendJoystick(int16_t yaw, int16_t pitch, int16_t roll)
+{
+    JoystickPayload payload;
+    payload.device_type = static_cast<uint8_t>(ControllerType::Joystick);
+    payload.pitch_speed = pitch;
+    payload.roll_speed = roll;
+    payload.yaw_speed = yaw;
+
+    PacketBuffer packet;
+
+    auto result = builder.buildCommand(
+        GimbalCmd::CMDSET,
+        GimbalCmd::ExternalDeviceControl,
+        payload,
+        ReplyRequirement::NoReply,
+        packet
+    );
+
+    if (result.isError()) return false;
+
+    return sendPacketMultiFrame(packet);
+}
+
+bool sendObtainInfo(uint8_t infoType)
+{
+    ObtainInfoRequestPayload payload;
+    payload.ctrl_byte = infoType;
+
+    PacketBuffer packet;
+
+    auto result = builder.buildCommand(
+        GimbalCmd::CMDSET,
+        GimbalCmd::ObtainInformation,
+        payload,
+        ReplyRequirement::ReplyRequired,
+        packet
+    );
+
+    if (result.isError()) return false;
+
+    return sendPacketMultiFrame(packet);
+}
+
+bool sendCameraRecord(bool start)
+{
+    CameraMotionPayload payload;
+    payload.command = static_cast<uint16_t>(
+        start ? CameraMotionCommand::StartRecording
+              : CameraMotionCommand::StopRecording
+    );
+
+    PacketBuffer packet;
+
+    auto result = builder.buildCommand(
+        CameraCmd::CMDSET,
+        CameraCmd::Motion,
+        payload,
+        ReplyRequirement::NoReply,
+        packet
+    );
+
+    if (result.isError()) return false;
+
+    bool ok = sendPacketMultiFrame(packet);
+
+    if (ok) {
+        txCameraCount++;
+        Serial.print(F(">>> CAMERA "));
+        Serial.println(start ? F("START") : F("STOP"));
+    }
+
+    return ok;
+}
+
+void handleRecordButton()
+{
+    bool reading = digitalRead(JOYSTICK_SW_PIN);
+
+    if (reading != lastButtonRead) {
+        lastDebounceMs = millis();
+        lastButtonRead = reading;
+    }
+
+    if (millis() - lastDebounceMs < DEBOUNCE_MS) return;
+
+    if (lastButtonStable == HIGH && reading == LOW) {
+        isRecording = !isRecording;
+        if (ENABLE_CAN) sendCameraRecord(isRecording);
+    }
+
+    lastButtonStable = reading;
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    pinMode(JOYSTICK_SW_PIN, INPUT_PULLUP);
+
+    Serial.println();
+    Serial.println(F("========================================"));
+    Serial.println(F(" DJI CAN + SBUS simultaneous test"));
+    Serial.println(F("========================================"));
+
+    if (ENABLE_SBUS) {
+        sbusSerial.begin(100000);
+        sbusResetChannels();
+        Serial.print(F("[OK] SBUS TX on D"));
+        Serial.println(SBUS_TX_PIN);
+        Serial.println(F("     -> 74HC04 -> RSA pin 3"));
+    }
+
+    if (ENABLE_CAN) {
+        SPI.begin();
+
+        mcp2515.reset();
+        delay(50);
+
+        if (mcp2515.setBitrate(CAN_1000KBPS, MCP_CLOCK) !=
+            MCP2515::ERROR_OK) {
+            Serial.println(F("[ERR] setBitrate"));
+            while (1) {}
+        }
+
+        if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) {
+            Serial.println(F("[ERR] setNormalMode"));
+            while (1) {}
+        }
+
+        mcp2515.setFilterMask(MCP2515::MASK0, false, 0);
+        mcp2515.setFilterMask(MCP2515::MASK1, false, 0);
+        mcp2515.setFilter(MCP2515::RXF0, false, 0);
+
+        builder.resetSequence(0);
+
+        Serial.println(F("[OK] CAN Normal 1Mbps"));
+    }
+
+    Serial.println(F("AD_COM: 10k/47k to COMMON GND (Arduino GND = RSA pin6)"));
+    Serial.println(F("========================================"));
+}
+
+void loop()
+{
+    if (ENABLE_CAN) {
+        pollIncoming();
+        handleRecordButton();
+    }
+
+    unsigned long now = millis();
+
+    int rawX = analogRead(JOYSTICK_X_PIN);
+    int rawY = analogRead(JOYSTICK_Y_PIN);
+
+    lastYaw = mapJoystickToDJI(rawX, false);
+    lastPitch = mapJoystickToDJI(rawY, true);
+    lastRoll = 0;
+
+    if (ENABLE_CAN && now - lastJoystickMs >= JOYSTICK_INTERVAL_MS) {
+        lastJoystickMs = now;
+        if (sendJoystick(lastYaw, lastPitch, lastRoll)) {
+            txJoystickCount++;
+        }
+    }
+
+    if (ENABLE_CAN && now - lastInfoMs >= INFO_INTERVAL_MS) {
+        lastInfoMs = now;
+        if (sendObtainInfo(0x01)) txInfoCount++;
+    }
+
+    if (ENABLE_SBUS && now - lastSbusMs >= SBUS_INTERVAL_MS) {
+        lastSbusMs = now;
+        updateSbusFromJoystick(lastYaw, lastPitch, lastRoll);
+        sbusPackAndSend();
+    }
+
+    if (now - lastStatusMs >= STATUS_PRINT_MS) {
+        lastStatusMs = now;
+
+        Serial.print(F("JS Y="));
+        Serial.print(lastYaw);
+        Serial.print(F(" P="));
+        Serial.print(lastPitch);
+        Serial.print(F(" | CAN_tx="));
+        Serial.print(txJoystickCount);
+        Serial.print(F(" fail="));
+        Serial.print(canSendFailCount);
+        Serial.print(F(" RX="));
+        Serial.print(rxPacketCount);
+        Serial.print(F(" | SBUS_tx="));
+        Serial.print(txSbusCount);
+        Serial.print(F(" | REC="));
+        Serial.print(isRecording ? F("ON") : F("OFF"));
+
+        if (haveAttitude) {
+            Serial.print(F(" | AttY="));
+            Serial.print(attYaw / 10.0f, 1);
+        }
+
+        Serial.println();
+    }
+}
