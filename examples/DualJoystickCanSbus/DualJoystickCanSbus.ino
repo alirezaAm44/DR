@@ -1,22 +1,25 @@
 #include <SPI.h>
-#include <mcp2515.h>
 #include <DJIRonin.h>
+#include <DJIRonin/transport/mcp2515/MCP2515Driver.h>
 #include <SBUSNanoTx/SBUSNanoTx.h>
 using namespace dji::ronin;
 
 // Arduino Nano / ATmega328P field-test configuration.
 // A1=Yaw, A2=Pitch, D2=Record, D8=SBUS, D10=MCP2515 CS.
+// Ronin SBUS polarity is configured in Ronin software; no extra
+// inversion logic is needed in the CAN path.
 const bool ENABLE_CAN = true;
 const bool ENABLE_SBUS = true;
-const bool SBUS_INVERTED = false; // Set Ronin SBUS polarity to match.
+const bool SBUS_INVERTED = false; // Must match the polarity selected in Ronin software.
 const uint8_t JOY_YAW=A1, JOY_PITCH=A2, REC_PIN=2, CAN_CS=10;
-const CAN_CLOCK MCP_CLOCK=MCP_8MHZ;
 const int JOY_CENTER=512, DEAD_ZONE=40;
 const int16_t DJI_MIN=-7500, DJI_MAX=7500;
 const uint16_t SBUS_MIN=352, SBUS_MID=1024, SBUS_MAX=1696;
 const uint8_t CH_YAW=0, CH_PITCH=1, CH_RECORD=3;
 const uint32_t JOY_MS=20, SBUS_MS=14, INFO_MS=500, STATUS_MS=250, DEBOUNCE_MS=40;
 
+// IMPORTANT: MCP2515Driver is part of the DR library and must be included
+// explicitly. The previous example used the type without including its header.
 MCP2515Driver can(CAN_CS);
 DJIRonin ronin(can);
 PacketBuilder builder;
@@ -105,7 +108,7 @@ void handleButton(){
 }
 
 void setup(){
-  Serial.begin(115200);delay(500);pinMode(REC_PIN,INPUT_PULLUP);pinMode(8,OUTPUT);builder.resetSequence(0);
+  Serial.begin(115200);delay(500);pinMode(REC_PIN,INPUT_PULLUP);builder.resetSequence(0);
   Serial.println(F("=== DJI R SDK / ARDUINO NANO / CAN + SBUS ==="));
   Serial.println(F("A1=Yaw A2=Pitch D2=Record D8=SBUS D10=MCP2515 CS"));
   Serial.println(F("CAN=1Mbps, MCP2515=8MHz, Joystick=20ms"));
